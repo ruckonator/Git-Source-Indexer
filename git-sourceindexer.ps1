@@ -2,13 +2,16 @@
 
 <#
 .DESCRIPTION
-  Github source indexer will index PDB files with HTTP source file references to a Github repository. 
-   - Adapted from http://sourcepack.codeplex.com 
+  Git source indexer will index PDB files with HTTP source file references to either a Github or VSTS git repository. 
+   - Adapted from Heamoglobin/GitHub-Source-Indexer who adapted it from http://sourcepack.codeplex.com 
+   
 
 .PARAMETER symbolsFolder
   The path of the directory to recursively search for pdb files to index. 
 .PARAMETER userId
   The github user ID.
+.PARAMETER useVSTS
+  Uses uses tf to retive souce stored in VSTS git repo at debug-time.
 .PARAMETER repository
   The github repository name containing the matching source files.
 .PARAMETER branch
@@ -38,10 +41,24 @@
   This is an important switch and is recommended because PDBs don't often store case sensitivity 
   for files while github servers expect case sensitivity for the files that are requested. Use of 
   this switch implies switch ignoreUnknown.
+.PARAMETER previousCommit n
+  Use HEAD~n commit when retrieving source. This uses the local repo to determin the commit id to add the the PDB source information
+.PARAMETER vstsAccountName 
+  Used to construct the URL e.g -vstsAccount myaccount will create the url https://myaccount.visualstudio.com
+.PARAMETER vstsProject
+  Used to add the project name to the URL. e.g. -vstsProject project will add /project to the VSTS account provided.
+  The default of project1 is used if not provided.
+.PARAMETER vstsCommitID
+  Do not look in the local repo for the commitID. Use the one provided instead
+.PARAMETER gitVSTSUrl
+  Use the string provided instead of the default visualstudio.com when constructing the URL for source retrival
+.PARAMETER gitExePath
+  Provide the full path of git.exe instead of letting the script try to find it.
+ 
 
 .EXAMPLE 
-  .\github-sourceindexer.ps1 -symbolsFolder "C:\git\DirectoryContainingPdbFilesToIndex" -userId "GithubUsername" -repository "GithubRepositoryName" -branch "master" -sourcesRoot "c:\git\OriginalCompiledProjectPath" -verbose
-  
+  .\git-sourceindexer.ps1 -symbolsFolder "C:\git\DirectoryContainingPdbFilesToIndex" -userId "GithubUsername" -repository "GithubRepositoryName" -branch "master" -sourcesRoot "c:\git\OriginalCompiledProjectPath" -verbose
+  .\git-sourceindexer.ps1 -useVSTS -symbolsFolder "C:\git\DirectoryContainingPdbFilesToIndex" -repository "VSTSGitRepositoryName"   -vstsAccountName "myaccount" -vstsProject "myProject" -branch "master" -dbgToolsPath "D:\pdbutil" -sourcesRoot "c:\git\OriginalCompiledProjectPath" 
   Description
   -----------
   This command will index all pdb files located in the C:\git\DirectoryContainingPdbFilesToIndex directory and subdirectories, 
@@ -58,7 +75,7 @@ param(
        [string] $symbolsFolder,
        
        ## github user ID
-       [Parameter(Mandatory = $true)]
+       #[Parameter(Mandatory = $true)]
        [string] $userId,
        
        ## github repository name
@@ -68,15 +85,36 @@ param(
        ## github branch name
        [Parameter(Mandatory = $true)]
        [string] $branch,
+
+       ## Use VSTS instead of github
+       [switch] $useVSTS,
        
        ## A root path for the source files
        [string] $sourcesRoot,
        
        ## Debugging Tools for Windows installation path
        [string] $dbgToolsPath,
+
+       ## Path to Git.exe
+       [string] $gitExePath,
        
        ## Github URL
        [string] $gitHubUrl,
+
+       ## VSTS Git URL
+       [string] $gitVSTSUrl,
+
+       ## VSTS Collection
+       [string] $vstsCollection,
+
+       ## VSTS Collection
+       [string] $vstsProject,
+
+       ## VSTS AccountName
+       [string] $vstsAccountName,
+
+       ## VSTS git commitID
+       [string] $vstsCommitID,
        
        ## Ignore a source path that contains any of the strings in this array
        [string[]] $ignore,
@@ -88,7 +126,10 @@ param(
        [switch] $serverIsRaw,
        
        ## Verify the filenames in the tree in the local repository
-       [switch] $verifyLocalRepo
+       [switch] $verifyLocalRepo,
+
+       ## Use pervious nth commit
+       [int16] $previousCommit
        )
        
 
@@ -177,28 +218,43 @@ function FindGitExe {
     }
     
     if( [IntPtr]::size -eq 4 ) {
-        return $null
+        return $null;
     }
     
-    $gitexe = ${env:ProgramFiles(x86)} + $suffix
+    $gitexe = ${env:ProgramFiles(x86)} + $suffix;
     if (Test-Path $gitexe) {
-        return $gitexe
+        return $gitexe;
     }
+
+    $gitexe = (get-command git.exe).path;
+    if (Test-Path $gitexe)
+    {
+        return $gitexe;
+    }
+
+    return null;
     
-    return $null
 }
 
 ###############################################################
-
+ 
 function WriteStreamHeader {
   param ([string] $streamPath)
   
   Write-Verbose "Preparing stream header section..."
 
   Add-Content -value "SRCSRV: ini ------------------------------------------------" -path $streamPath
-  Add-Content -value "VERSION=1" -path $streamPath
+  if ($useVSTS)
+  {
+    Add-Content -value "VERSION=3" -path $streamPath
+    Add-Content -value "VERCTL=VSTS Git" -path $streamPath
+  }
+  else
+  {
+    Add-Content -value "VERSION=1" -path $streamPath
+    Add-Content -value "VERCTL=Archive" -path $streamPath
+  }
   Add-Content -value "INDEXVERSION=2" -path $streamPath
-  Add-Content -value "VERCTL=Archive" -path $streamPath
   Add-Content -value ("DATETIME=" + ([System.DateTime]::Now)) -path $streamPath
 }
 
@@ -210,11 +266,24 @@ function WriteStreamVariables {
   Write-Verbose "Preparing stream variables section..."
 
   Add-Content -value "SRCSRV: variables ------------------------------------------" -path $streamPath
-  Add-Content -value "SRCSRVVERCTRL=http" -path $streamPath
-  Add-Content -value "HTTP_ALIAS=$gitHubUrl" -path $streamPath
-  Add-Content -value "HTTP_EXTRACT_TARGET=%HTTP_ALIAS%/%var2%/%var3%$raw/%var4%/%var5%" -path $streamPath
-  Add-Content -value "SRCSRVTRG=%http_extract_target%" -path $streamPath
-  Add-Content -value "SRCSRVCMD=" -path $streamPath
+  if ($useVSTS)
+  {
+    Add-Content -value "SRCSRVVERCTRL=tfs" -path $streamPath
+    Add-Content -value "COMMIT=$commitID" -path $streamPath
+    Add-Content -value "SHORT_COMMIT=$shortCommitId" -path $streamPath
+    Add-Content -value "TFS_EXTRACT_CMD=tf.exe git view /collection:$vstsURLBase /teamProject:$vstsProject /repository:$repository /path:%var2% /commitId:%commit% /output:%srcsrvtrg%" -path $streamPath
+    Add-Content -value "TFS_EXTRACT_TARGET=%targ%\$repository\%fnbksl%(%var2%)\%short_commit%\%fnfile%(%var1%)" -path $streamPath
+    Add-Content -value "SRCSRVTRG=%tfs_extract_target%" -path $streamPath
+    Add-Content -value "SRCSRVCMD=%tfs_extract_cmd%" -path $streamPath
+  }
+  else
+  {
+    Add-Content -value "SRCSRVVERCTRL=http" -path $streamPath
+    Add-Content -value "HTTP_ALIAS=$gitHubUrl" -path $streamPath
+    Add-Content -value "HTTP_EXTRACT_TARGET=%HTTP_ALIAS%/%var2%/%var3%$raw/%var4%/%var5%" -path $streamPath
+    Add-Content -value "SRCSRVTRG=%http_extract_target%" -path $streamPath
+    Add-Content -value "SRCSRVCMD=" -path $streamPath
+  }
 }
 
 ###############################################################
@@ -323,8 +392,15 @@ function WriteStreamSources {
     }
     
     #Add-Content -value "HTTP_ALIAS=http://github.com/%var2%/%var3%$raw/%var4%/%var5%" -path $streamPath
-    Add-Content -value "$src*$userId*$repository*$branch*$filepath" -path $streamPath
-    Write-Verbose "Indexing source to $gitHubUrl/$userId/$repository$raw/$branch/$filepath"
+    if ($useVSTS)
+    {
+        Add-Content -value "$src*$filepath" -path $streamPath;
+    }
+    else
+    {
+        Add-Content -value "$src*$userId*$repository*$branch*$filepath" -path $streamPath;
+    }
+    Write-Verbose "Indexing source to $gitUrl/$userId/$repository$raw/$branch/$filepath";
   }
 }
 
@@ -335,16 +411,93 @@ if ($verifyLocalRepo) {
   $ignoreUnknown = $TRUE
 }
 
-if ([String]::IsNullOrEmpty($gitHubUrl)) {
-    $gitHubUrl = "http://github.com";
+if ([string]::IsNullOrEmpty($vstsCollection))
+{
+    $vstsCollection = "DefaultCollection"
 }
 
-# If the server serves raw then /raw does not need to be concatenated
-if ($serverIsRaw) {
-  $raw = "";
-} else {
-  $raw = "/raw";
+if ([string]::IsNullOrEmpty($vstsProject))
+{
+    $vstsProject = "Project1";
 }
+
+if ($useVSTS)
+{
+    if ([string]::IsNullOrEmpty($vstsAccountName))
+    {
+        throw "Error -vstsAccountName cannot be empty if useVSTS option is used";
+    }
+    if ([String]::IsNullOrEmpty($gitVSTSUrl))
+    {
+        $vstsURLBase = "https://$($vstsAccountName).visualstudio.com/$vstsCollection";
+    }
+    else
+    {
+        $vstsURLBase = "https://$($vstsAccountName).$($gitVSTSUrl)/$vstsCollection";
+    }
+    if([string]::IsNullOrEmpty($vstsCommitID))
+    {
+        if ([string]::IsNullOrEmpty($gitExePath))
+        {
+            $gitexe = FindGitExe;
+        }
+        else
+        {
+            $gitexe = $gitExePath;
+        }
+        if (!$gitexe) 
+        {
+            throw "Error: git.exe not found";
+        }
+    
+        $gitrepo = $sourcesRoot + "\.git"
+        if (!(Test-Path $gitrepo)) 
+        {
+            throw "Error: git repo not found: $gitrepo";
+        }
+
+        if ($previousCommit)
+        {
+            $position = "HEAD~$previousCommit";
+        }
+        else
+        {
+            $position = "HEAD";
+        }
+        
+    
+        $commitId = & "$gitexe" "--git-dir=$gitrepo" "rev-parse" "$position"
+        $shortCommitId = $commitId.Substring(0,6);
+        if ($LASTEXITCODE) 
+        {
+          throw "Error: Couldn't find the commitID";
+        }
+    }
+    else
+    {
+        $commitId = $vstsCommitID; 
+        $shortCommitId = $vstsCommitID.Substring(0,6);
+    }
+}
+else
+{
+    if ([String]::IsNullOrEmpty($gitHubUrl)) {
+        $gitUrl = "http://github.com";
+    }
+    else
+    {
+        $gitUrl = $gitHubUrl;
+    }
+    # If the server serves raw then /raw does not need to be concatenated
+    if ($serverIsRaw) {
+        $raw = "";
+    } else {
+        $raw = "/raw";
+    }
+}
+
+
+    
 
 # Check the debugging tools path
 $dbgToolsPath = CheckDebuggingToolsPath $dbgToolsPath
